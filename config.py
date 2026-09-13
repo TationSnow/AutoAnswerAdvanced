@@ -25,8 +25,12 @@ HOTKEY_EXIT = "ctrl+q"          # 退出
 # ================== 扫描 / 自动化 ==================
 
 SCAN_INTERVAL = 1.0             # 循环扫描间隔（秒）
-POST_CLICK_WAIT = 1.5           # 点击选项后等待秒数（等待界面反馈）
-POST_NEXT_WAIT = 1.5            # 点击下一题后等待秒数
+POST_CLICK_WAIT = 0.8           # 点击选项或确认按钮后等待界面更新
+POST_NEXT_WAIT = 1.2            # 点击下一题后等待秒数
+OPTION_CLICK_INTERVAL = 0.12    # 多选相邻选项点击间隔
+FEEDBACK_POLL_INTERVAL = 0.35   # 等待正确答案/解析时的轮询间隔
+FEEDBACK_TIMEOUT = 4.0          # 等待正确答案/解析的最长时间
+MIN_AUTO_ANSWER_CONFIDENCE = 0.55  # 低于该 OCR 置信度时只展示不点击
 
 AUTO_CLICK_ENABLED = True       # 是否自动点击选项
 AUTO_NEXT_ENABLED = True        # 是否自动点击下一题
@@ -48,6 +52,7 @@ SIMILARITY_THRESHOLD = 0.85     # 语义命中阈值
 # ================== 按钮关键词（OCR 识别） ==================
 
 BUTTON_KEYWORDS = {
-    "next":   ["下一题", "下一页", "下一章", "继续答题", "下一节"],
-    "submit": ["提交答案", "提交", "确认答案", "确定", "确认"],
+    "confirm": ["确认答案"],
+    "next": ["下一题", "下一页", "下一章", "继续答题", "下一节"],
+    "submit": ["提交答案", "提交"],
 }
