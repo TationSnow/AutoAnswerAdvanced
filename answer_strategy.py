@@ -58,6 +58,90 @@ def _canonical_bool(text: str) -> Optional[bool]:
     return None
 
 
+def extract_json_payload(text: str) -> Optional[Dict[str, Any]]:
+    """从模型输出中容错提取 JSON 对象。
+
+    线上接口不支持 JSON Schema 时会退化为纯文本协议，模型常常把 JSON 包在
+    Markdown 代码块里、或在 JSON 前后附带思考文字。这里依次尝试：
+
+    1. 直接解析整段文本；
+    2. 去掉 ``` 代码块围栏后再解析；
+    3. 扫描文本中所有成对花括号片段，**从后往前**解析（最终答案通常在末尾）。
+
+    字符串中的花括号会被忽略，避免把选项文字里的括号当成 JSON 边界。
+    """
+    candidate = (text or "").strip()
+    if not candidate:
+        return None
+
+    direct = _try_load_json(candidate)
+    if direct is not None:
+        return direct
+
+    for stripped in _strip_code_fences(candidate):
+        parsed = _try_load_json(stripped)
+        if parsed is not None:
+            return parsed
+
+    for fragment in reversed(_iter_brace_fragments(candidate)):
+        parsed = _try_load_json(fragment)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _try_load_json(text: str) -> Optional[Dict[str, Any]]:
+    """尝试把文本解析为 JSON 对象，失败返回 None。"""
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _strip_code_fences(text: str) -> List[str]:
+    """去掉 Markdown 代码块围栏，返回候选文本。"""
+    if "```" not in text:
+        return []
+    results = []
+    for block in re.findall(r"```[a-zA-Z]*\s*(.+?)```", text, re.DOTALL):
+        stripped = block.strip()
+        if stripped:
+            results.append(stripped)
+    return results
+
+
+def _iter_brace_fragments(text: str) -> List[str]:
+    """扫描出所有顶层花括号片段（忽略字符串内部的花括号）。"""
+    fragments: List[str] = []
+    depth = 0
+    start = -1
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    fragments.append(text[start:index + 1])
+                    start = -1
+    return fragments
+
+
 class BaseAnswerStrategy(ABC):
     """题型策略基类。"""
 
@@ -378,12 +462,9 @@ class AnswerParser:
         source: str,
     ) -> AnswerCandidate:
         """尝试把模型文本内容解析为 JSON，失败时返回无效答案。"""
-        try:
-            payload = json.loads(content)
-        except (TypeError, ValueError):
+        payload = extract_json_payload(content)
+        if payload is None:
             return AnswerCandidate.invalid("模型响应不是合法 JSON", source)
-        if not isinstance(payload, dict):
-            return AnswerCandidate.invalid("模型 JSON 不是对象", source)
         return self.from_payload(question, payload, source)
 
 

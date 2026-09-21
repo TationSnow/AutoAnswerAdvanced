@@ -64,6 +64,8 @@ from config import (  # noqa: E402
     DEEPSEEK_API_KEY,
     DEEPSEEK_BASE_URL,
     DEEPSEEK_ENABLE_SEARCH,
+    DEEPSEEK_JSON_SCHEMA_ENABLED,
+    DEEPSEEK_MAX_TOKENS,
     DEEPSEEK_MODEL,
     DEFAULT_MODE,
     EMBEDDING_API_KEY,
@@ -314,7 +316,7 @@ class CaptureThread(QThread):
             return None
 
     def _init_ai(self) -> Optional[DeepSeekSolver]:
-        """初始化本地模型客户端。"""
+        """初始化本地/线上模型客户端。"""
         try:
             return DeepSeekSolver(
                 api_key=DEEPSEEK_API_KEY,
@@ -322,6 +324,8 @@ class CaptureThread(QThread):
                 model=DEEPSEEK_MODEL,
                 enable_search=DEEPSEEK_ENABLE_SEARCH,
                 knowledge_base=self.kb,
+                max_tokens=DEEPSEEK_MAX_TOKENS,
+                json_schema_enabled=DEEPSEEK_JSON_SCHEMA_ENABLED,
             )
         except Exception as exc:
             logger.error("AI 初始化失败: %s", exc)
@@ -330,9 +334,11 @@ class CaptureThread(QThread):
     def _print_banner(self) -> None:
         """输出版本、模式和热键提示。"""
         mode_label = "做题模式" if self.mode == MODE_QUIZ else "题库纪录模式"
+        ai_label = self.ai.describe() if self.ai is not None else "未初始化"
         logger.info(
             "\n%s\n自动答题助手已启动\n%s\n"
             "当前模式: %s\n捕获区域: %s\n"
+            "生成模型: %s\n"
             "自动点击: %s | 自动下一题: %s\n"
             "快捷键: Ctrl+F1 区域 | Ctrl+F2 暂停 | Ctrl+F3 识别 | "
             "Ctrl+F4 模式 | Ctrl+Q 退出\n%s",
@@ -340,6 +346,7 @@ class CaptureThread(QThread):
             "=" * 56,
             mode_label,
             self.region,
+            ai_label,
             "开" if AUTO_CLICK_ENABLED else "关",
             "开" if AUTO_NEXT_ENABLED else "关",
             "=" * 56,

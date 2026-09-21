@@ -192,7 +192,11 @@ MODEL_PROVIDER = "openai"  # 可选: openai, anthropic, deepseek
 | `DEEPSEEK_API_KEY` | `""` | DeepSeek API 密钥 |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/v1` | API 端点地址 |
 | `DEEPSEEK_MODEL` | `deepseek-chat` | 模型选择：`deepseek-chat`（快速）或 `deepseek-reasoner`（推理更强） |
-| `DEEPSEEK_ENABLE_SEARCH` | `True` | 是否启用联网搜索以获取更准确的事实性答案 |
+| `DEEPSEEK_ENABLE_SEARCH` | `False` | 是否启用联网搜索以获取更准确的事实性答案 |
+| `DEEPSEEK_MAX_TOKENS` | `2048` | 单次生成上限；推理型模型额度不足会导致正文为空 |
+| `DEEPSEEK_MAX_TOKENS_LIMIT` | `8192` | 检测到输出截断时自动加倍的硬上限 |
+| `DEEPSEEK_TIMEOUT` | `60` | 单次请求超时（秒） |
+| `DEEPSEEK_JSON_SCHEMA_ENABLED` | `True` | 是否优先尝试 json_schema；已知接口不支持时置 `False` 可省掉一次失败请求 |
 | `SCAN_INTERVAL` | `1.0` | 屏幕扫描间隔（秒） |
 | `CAPTURE_REGION` | `{left, top, width, height}` | 默认捕获区域（可通过区域选择器覆盖） |
 | `OCR_TEXT_SCORE` | `0.5` | 主通道识别置信度阈值（低于该值的文字块被丢弃） |
@@ -292,6 +296,31 @@ RapidOCR 使用 ONNX Runtime 作为推理后端，无需安装庞大的 PaddlePa
 
 
 识别出的题目文本中只要包含至少一个关键词，即可触发本地匹配。
+
+</details>
+
+<details>
+<summary><b>线上 API 一直提示“模型返回空响应”，答案拿不到怎么办？</b></summary>
+
+先看日志里的 `finish_reason` 与 `usage`（程序已把它们写进失败原因）：
+
+- **`finish_reason=length` + `reasoning_tokens` 等于全部额度**：
+  说明用的是**推理型/思考型模型**（模型名常带 reasoner、thinking、flash 等），
+  token 全部被思考过程消耗，正文（`content`）为空。处理方式：
+  提高 `DEEPSEEK_MAX_TOKENS`（程序也会在检测到截断时自动加倍重试，
+  上限为 `DEEPSEEK_MAX_TOKENS_LIMIT`），或改用非推理模型。
+- **`content` 为空但 `reasoning_content` 有内容**：
+  程序会自动改用 `reasoning_content` 解析答案，无需额外配置。
+- **`HTTP 400` 与输出格式无关**（例如 `Model not found`、鉴权失败）：
+  这类属于配置问题，程序会原样上报错误且不重试，请检查 `DEEPSEEK_BASE_URL` /
+  `DEEPSEEK_MODEL` / `DEEPSEEK_API_KEY` 是否匹配（注意别把线上模型名指向本机服务，或反之）。
+- **接口不支持 `json_schema`**：程序会自动降级 `json_schema → json_object → 纯文本`，
+  并记住结果，同一次运行内不再重复试探；已知接口不支持时可直接把
+  `DEEPSEEK_JSON_SCHEMA_ENABLED` 设为 `False`。
+- **请求超时**：推理型模型单次耗时可能超过一分钟，可提高 `DEEPSEEK_TIMEOUT`。
+
+启动日志里会打印 `生成模型` 一行，包含 endpoint、模型名、max_tokens 与协议梯度，
+可先据此确认配置没有错配。
 
 </details>
 

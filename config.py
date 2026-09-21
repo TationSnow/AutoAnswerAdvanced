@@ -5,6 +5,21 @@ DEEPSEEK_BASE_URL = "http://127.0.0.1:1234/v1"
 DEEPSEEK_MODEL = "qwen3.8-9b-heretic-uncensored-nvfp4"
 DEEPSEEK_ENABLE_SEARCH = False
 
+
+# 生成参数
+# 注意：推理型/思考型模型（模型名常带 reasoner、thinking、flash 等）会先输出思考内容，
+# max_tokens 过小会把额度全部消耗在思考上，导致正文为空（finish_reason=length），
+# 表现为“模型返回空响应”。这里默认给足额度，并在检测到截断时自动加倍重试。
+DEEPSEEK_MAX_TOKENS = 2048          # 单次生成上限
+DEEPSEEK_MAX_TOKENS_LIMIT = 8192    # 因输出截断自动加倍时的硬上限
+DEEPSEEK_TEMPERATURE = 0.0
+DEEPSEEK_TIMEOUT = 60              # 单次请求超时（秒）；推理型模型需要更大值
+
+# 是否优先尝试 json_schema 强约束输出。
+# 不支持该格式的接口会返回 400，程序会自动降级为 json_object → 纯文本并记住结果；
+# 已知接口不支持时可直接置 False，省掉一次注定失败的请求。
+DEEPSEEK_JSON_SCHEMA_ENABLED = False
+
 # ================== 屏幕捕获配置 ==================
 
 CAPTURE_REGION = {
