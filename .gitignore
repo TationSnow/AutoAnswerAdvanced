@@ -45,3 +45,6 @@ worktrees/
 .agents/worktrees/
 .typert-*/
 native/system/test/bin/
+.workbuddy/
+.claude/
+.codex/

@@ -2,6 +2,7 @@
 
 程序负责捕获屏幕、调用 OCR/题库/模型，并按题型执行安全的自动答题状态机。
 """
+import hashlib
 import json
 import logging
 import os
@@ -68,6 +69,9 @@ from config import (  # noqa: E402
     EMBEDDING_API_KEY,
     EMBEDDING_BASE_URL,
     EMBEDDING_MODEL,
+    FAIL_BACKOFF_LOG_EVERY,
+    FAIL_BACKOFF_MAX_INTERVAL,
+    FAIL_BACKOFF_THRESHOLD,
     FEEDBACK_POLL_INTERVAL,
     FEEDBACK_TIMEOUT,
     HOTKEY_CAPTURE,
@@ -178,6 +182,11 @@ class CaptureThread(QThread):
         self.kb_hit_count = 0
         self.recorded_count = 0
 
+        # 无进展退避状态：画面内容不变且始终无法推进时放慢扫描频率。
+        self.scan_interval = SCAN_INTERVAL
+        self.no_progress_key: Optional[str] = None
+        self.no_progress_count = 0
+
         self.answer_parser = AnswerParser()
         self.session = QuestionSession()
         self.planner = AutomationPlanner(
@@ -226,7 +235,7 @@ class CaptureThread(QThread):
                     self._safe_process()
                 elif not self.paused:
                     self._safe_process()
-                time.sleep(SCAN_INTERVAL)
+                time.sleep(self.scan_interval)
         except Exception as exc:
             logger.error("捕获线程异常: %s", exc)
         finally:
@@ -247,12 +256,34 @@ class CaptureThread(QThread):
         """初始化 OCR。"""
         try:
             logger.info("正在初始化 OCR 引擎...")
-            engine = OCREngine(use_gpu=False, lang="ch", show_log=False)
+            engine = OCREngine(
+                use_gpu=False,
+                lang="ch",
+                show_log=False,
+                warmup_size=self._warmup_size_from_region(),
+            )
             logger.info("OCR 版本: %s", engine.get_version_info())
             return engine
         except Exception as exc:
             logger.error("OCR 初始化失败: %s", exc)
             return None
+
+    def _warmup_size_from_region(self) -> Tuple[int, int]:
+        """用真实捕获区域尺寸预热 OCR。
+
+        首次推理会包含线程池与内存分配等一次性开销，实测可能长达上百秒。
+        用接近真实截图尺寸的合成图在启动阶段预热，可把这段开销挪到启动时，
+        避免运行中突然出现单帧超长卡顿。
+        """
+        try:
+            height = int(self.region.get("height", 0))
+            width = int(self.region.get("width", 0))
+        except (TypeError, ValueError):
+            height = width = 0
+        if height <= 0 or width <= 0:
+            return (720, 1280)
+        # 上限 1600，避免预热本身耗时过长。
+        return (min(height, 1600), min(width, 1600))
 
     def _init_kb(self) -> Optional[KnowledgeBase]:
         """初始化 Embedding 和题库。"""
@@ -323,15 +354,80 @@ class CaptureThread(QThread):
 
         question = self._capture_question()
         if question is None or not question.is_valid:
+            # 识别不到可用题目时记录无进展原因，便于定位“卡在同一处”的问题。
+            self._note_no_progress(question)
             return
 
         if self.session.should_process(question):
+            self._reset_progress()
             self._handle_new_question(question)
         elif self.session.state in {
             SessionState.WAITING_FEEDBACK,
             SessionState.WAITING_NEXT,
         }:
-            self._resume_question(question)
+            if self._resume_question(question):
+                self._reset_progress()
+            else:
+                self._note_no_progress(question)
+        else:
+            self._note_no_progress(question)
+
+    def _no_progress_identity(self, question: Optional[QuestionSnapshot]) -> str:
+        """生成“无进展画面”的身份标识，用于判断画面是否真的没有变化。"""
+        if question is None:
+            return "no-frame"
+        raw = question.raw_text or ""
+        raw_signature = (
+            hashlib.md5(raw.encode("utf-8")).hexdigest()[:12] if raw else ""
+        )
+        return "%s|%s" % (question.error, raw_signature or question.identity_key)
+
+    def _note_no_progress(self, question: Optional[QuestionSnapshot]) -> None:
+        """记录一次“本帧没有产生任何可执行动作”，并做退避。
+
+        画面内容不变、题目又始终无法解析时，若继续按固定间隔重复识别，
+        只会不断刷出同一批日志并持续占用 CPU。这里统计连续无进展次数，
+        达到阈值后逐步放慢扫描频率，并只做少量说明性提示。
+        """
+        key = self._no_progress_identity(question)
+        if key == self.no_progress_key:
+            self.no_progress_count += 1
+        else:
+            self.no_progress_key = key
+            self.no_progress_count = 1
+            self.scan_interval = SCAN_INTERVAL
+
+        if self.no_progress_count >= FAIL_BACKOFF_THRESHOLD:
+            self.scan_interval = min(
+                SCAN_INTERVAL * self.no_progress_count,
+                FAIL_BACKOFF_MAX_INTERVAL,
+            )
+
+        should_log = self.no_progress_count == FAIL_BACKOFF_THRESHOLD or (
+            self.no_progress_count > FAIL_BACKOFF_THRESHOLD
+            and self.no_progress_count % FAIL_BACKOFF_LOG_EVERY == 0
+        )
+        if should_log:
+            reason = question.error if question is not None else "未识别到题目画面"
+            raw = (
+                (question.raw_text or "").replace("\n", " / ")[:200]
+                if question is not None
+                else ""
+            )
+            logger.warning(
+                "同一画面已连续 %d 次无法推进（%s），扫描间隔调整为 %.1fs。"
+                " 识别到的文字: %s",
+                self.no_progress_count,
+                reason,
+                self.scan_interval,
+                raw or "（空）",
+            )
+
+    def _reset_progress(self) -> None:
+        """恢复正常扫描频率。"""
+        self.no_progress_key = None
+        self.no_progress_count = 0
+        self.scan_interval = SCAN_INTERVAL
 
     def _capture_question(self) -> Optional[QuestionSnapshot]:
         """截取并识别当前题面。"""
@@ -457,32 +553,39 @@ class CaptureThread(QThread):
                 if feedback is not None:
                     self._emit_answer(question, feedback)
                 if self._try_click_next(latest):
-                    self.session.mark_finished()
+                    # 记录点击而不是直接判定完成：页面若未推进仍可有限次重试。
+                    self.session.record_next_click()
                     self.cooldown_until = time.time() + POST_NEXT_WAIT
                     return
                 self.session.mark_waiting_next()
             elif action.kind == AutomationActionType.CLICK_NEXT:
                 if action.target is not None:
                     self.operator.click_at(action.target)
-                    self.session.mark_finished()
+                    self.session.record_next_click()
                     self.cooldown_until = time.time() + POST_NEXT_WAIT
                     return
 
-    def _resume_question(self, question: QuestionSnapshot) -> None:
-        """继续等待反馈或下一题按钮，不重复选择答案。"""
+    def _resume_question(self, question: QuestionSnapshot) -> bool:
+        """继续等待反馈或下一题按钮，不重复选择答案。
+
+        :return: 本帧是否产生了实际动作（用于无进展退避判断）。
+        """
+        acted = False
         answer = self.last_answer
         if answer is not None and self._has_feedback_text(question.raw_text):
             feedback = self._parse_feedback(question, answer)
             if feedback is not None:
                 self._emit_answer(question, feedback)
+                acted = True
 
         if not self.session.can_retry_next(POST_NEXT_WAIT):
-            return
+            return acted
         if self._try_click_next(question):
-            self.session.mark_finished()
+            self.session.record_next_click()
             self.cooldown_until = time.time() + POST_NEXT_WAIT
-        else:
-            self.session.mark_waiting_next()
+            return True
+        self.session.mark_waiting_next()
+        return acted
 
     def _wait_for_feedback(
         self,

@@ -35,6 +35,43 @@ MIN_AUTO_ANSWER_CONFIDENCE = 0.55  # 低于该 OCR 置信度时只展示不点�
 AUTO_CLICK_ENABLED = True       # 是否自动点击选项
 AUTO_NEXT_ENABLED = True        # 是否自动点击下一题
 
+# ================== OCR 识别阈值与鲁棒性 ==================
+# 说明：RapidOCR 默认把“识别置信度 < text_score”的文字块直接丢弃。
+# 实测题库页面上的孤立单字选项（判断题的“对/错”）识别得分只有 0.499 左右，
+# 恰好压在主通道阈值 0.5 之下，会被整块丢弃，导致判断题永远解析不出选项、
+# 程序在同一题上无限重复识别。主通道保持严格阈值以保证结果干净，
+# 解析失败时再由补救通道用放宽阈值把这类文字救回来。
+
+OCR_TEXT_SCORE = 0.5            # 主通道：识别置信度阈值
+OCR_DET_BOX_THRESH = 0.5        # 主通道：检测框置信度阈值
+OCR_DET_UNCLIP_RATIO = 1.6      # 主通道：检测框扩张比例
+OCR_MIN_ITEM_SCORE = 0.2        # 主通道：文字块保留的最低置信度
+
+OCR_RESCUE_TEXT_SCORE = 0.1     # 补救通道：识别置信度阈值（救回“对/错”等低分单字）
+OCR_RESCUE_DET_BOX_THRESH = 0.2  # 补救通道：检测框置信度阈值
+OCR_RESCUE_DET_UNCLIP_RATIO = 1.6  # 补救通道：检测框扩张比例
+OCR_RESCUE_MIN_ITEM_SCORE = 0.1  # 补救通道：文字块保留的最低置信度
+OCR_RESCUE_COOLDOWN = 3.0       # 同一画面重复补救的最小间隔（秒）
+
+OCR_MAX_PIXELS = 6000000        # 截图超过该像素数时先缩放，避免检测耗时爆炸
+OCR_MAX_ASPECT_RATIO = 8.0      # 极端长宽比会触发检测模型内部放大，先补边规避
+OCR_WARMUP_SIZE = None          # OCR 预热图尺寸 (高, 宽)；None 时使用默认值
+
+OCR_SLOW_WARN_SECONDS = 5.0     # 单帧推理超过该秒数输出告警
+OCR_SLOW_ERROR_SECONDS = 30.0   # 单帧推理超过该秒数输出错误与排查建议
+
+# ================== 无进展退避 ==================
+# 画面内容不变且始终无法解析时，逐步放慢扫描频率，避免以 1 秒间隔
+# 无限重复识别并刷新同一批日志。
+
+FAIL_BACKOFF_THRESHOLD = 3      # 连续无进展次数达到该值后开始退避
+FAIL_BACKOFF_MAX_INTERVAL = 5.0  # 退避后的扫描间隔上限（秒）
+FAIL_BACKOFF_LOG_EVERY = 10     # 退避期间每隔多少次无进展再提醒一次
+
+# ================== 页面装饰关键词（OCR 识别） ==================
+
+PAGE_CHROME_KEYWORDS = ["题库练习", "纠"]  # 页面标题、悬浮纠错按钮等非题目文字
+
 # ================== 模式 ==================
 
 MODE_QUIZ = "quiz"              # 做题模式：查库 → LLM → 点击；不写库

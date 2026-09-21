@@ -195,6 +195,12 @@ MODEL_PROVIDER = "openai"  # 可选: openai, anthropic, deepseek
 | `DEEPSEEK_ENABLE_SEARCH` | `True` | 是否启用联网搜索以获取更准确的事实性答案 |
 | `SCAN_INTERVAL` | `1.0` | 屏幕扫描间隔（秒） |
 | `CAPTURE_REGION` | `{left, top, width, height}` | 默认捕获区域（可通过区域选择器覆盖） |
+| `OCR_TEXT_SCORE` | `0.5` | 主通道识别置信度阈值（低于该值的文字块被丢弃） |
+| `OCR_RESCUE_TEXT_SCORE` | `0.1` | 补救通道识别阈值，用于救回“对/错”等低分单字选项 |
+| `OCR_RESCUE_COOLDOWN` | `3.0` | 同一画面重复补救识别的最小间隔（秒） |
+| `OCR_MAX_PIXELS` | `6000000` | 截图超过该像素数时先缩放，避免识别耗时爆炸 |
+| `OCR_SLOW_WARN_SECONDS` | `5.0` | 单帧 OCR 超过该耗时输出告警 |
+| `FAIL_BACKOFF_MAX_INTERVAL` | `5.0` | 画面无进展时的最大扫描间隔（秒） |
 
 ---
 
@@ -294,7 +300,31 @@ RapidOCR 使用 ONNX Runtime 作为推理后端，无需安装庞大的 PaddlePa
 
 - 适当放大捕获区域，确保文字没有被裁切
 - 确保监控区域有足够的对比度（避免透明或重叠窗口干扰）
-- 调整 `_extract_texts()` 中的置信度阈值（默认 `0.4`）— 调高可过滤噪声，调低可捕获更多文字
+- 调整 `config.py` 中的识别阈值：`OCR_TEXT_SCORE`（主通道识别阈值，默认 `0.5`）
+  与 `OCR_RESCUE_TEXT_SCORE`（补救通道，默认 `0.1`）— 调高可过滤噪声，调低可捕获更多文字
+
+</details>
+
+<details>
+<summary><b>判断题/单选题一直卡在同一题不动，日志重复输出同一行 OCR 结果怎么办？</b></summary>
+
+这类现象说明 **OCR 识别结果无法解析成有效题目**（典型原因是选项没被识别出来，
+例如判断题的“对/错”是孤立单字，识别得分约 0.499，会被 RapidOCR 的默认阈值 0.5 丢掉），
+主循环因此每帧都判定“题目无效”并静默返回。
+
+程序内置的处理机制：
+
+- **补救通道**：主通道解析失败时，自动用放宽阈值（`OCR_RESCUE_*`）再识别一遍，
+  把这类低分单字选项救回来；同一画面在 `OCR_RESCUE_COOLDOWN` 秒内只补救一次。
+- **失败原因日志**：无法解析时会输出具体原因（题干长度、选项数量），
+  可用于判断是“题干没识别到”还是“选项没识别到”。
+- **无进展退避**：画面内容不变且始终无法推进时，扫描间隔会逐步放慢到
+  `FAIL_BACKOFF_MAX_INTERVAL`，避免持续刷同一批日志并占满 CPU。
+- **慢推理告警**：单帧 OCR 超过 `OCR_SLOW_WARN_SECONDS` 会输出告警，
+  超过 `OCR_SLOW_ERROR_SECONDS` 会提示缩小捕获区域（截图越大、画面越花，识别越慢）。
+
+排查建议：先用 `python debug_ocr.py --image 截图.png` 查看识别出的文字块与解析结果，
+确认捕获区域是否完整覆盖题干与全部选项。
 
 </details>
 

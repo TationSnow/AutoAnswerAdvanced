@@ -23,6 +23,12 @@ class SessionState(str, Enum):
     DONE = "done"
 
 
+# 同一题最多重试点击“下一题”的次数。
+# 点击后页面没有推进（网络慢、按钮未响应）时允许有限次重试，
+# 达到上限即停止，避免在同一题上无限点击。
+MAX_NEXT_CLICKS = 3
+
+
 class QuestionSession:
     """保证同一题只执行一次作答，并支持下一题恢复。"""
 
@@ -30,6 +36,7 @@ class QuestionSession:
         self.current_key: Optional[str] = None
         self.state = SessionState.IDLE
         self.last_action_at = 0.0
+        self.next_click_count = 0
 
     def should_process(self, question: QuestionSnapshot) -> bool:
         """新题返回 True，同一题已经处理则返回 False。"""
@@ -38,6 +45,7 @@ class QuestionSession:
             self.current_key = key
             self.state = SessionState.SOLVING
             self.last_action_at = time.time()
+            self.next_click_count = 0
             return True
         return False
 
@@ -51,11 +59,22 @@ class QuestionSession:
         self.state = SessionState.WAITING_NEXT
         self.last_action_at = time.time()
 
+    def record_next_click(self) -> None:
+        """记录一次“下一题”点击，并允许页面未推进时重试。
+
+        与直接标记完成不同，这里保留 WAITING_NEXT 状态，
+        使页面在等待时间内没有变化时可以再次尝试推进。
+        """
+        self.next_click_count += 1
+        self.state = SessionState.WAITING_NEXT
+        self.last_action_at = time.time()
+
     def can_retry_next(self, retry_after: float, now: Optional[float] = None) -> bool:
         """判断是否已经到安全重试下一题的时间。"""
         current = time.time() if now is None else now
         return (
             self.state in {SessionState.WAITING_FEEDBACK, SessionState.WAITING_NEXT}
+            and self.next_click_count < MAX_NEXT_CLICKS
             and current - self.last_action_at >= retry_after
         )
 
@@ -69,6 +88,7 @@ class QuestionSession:
         self.current_key = None
         self.state = SessionState.IDLE
         self.last_action_at = 0.0
+        self.next_click_count = 0
 
 
 @dataclass
