@@ -250,6 +250,72 @@ class AnswerCandidate:
         )
 
 
+class NavigationDirection(str, Enum):
+    """题目之间的翻页方向（语义层）。
+
+    只描述“要去哪一题”，不描述用什么手段实现：
+    按钮点击与手势滑动都复用同一个方向语义，
+    由 navigation 模块决定具体用哪种方式落地。
+    """
+
+    NEXT = "next"
+    PREV = "prev"
+
+    @property
+    def button_role(self) -> str:
+        """返回该方向在 ``QuestionSnapshot.button_boxes`` 中的按钮角色名。"""
+        return "next" if self is NavigationDirection.NEXT else "prev"
+
+    @property
+    def label(self) -> str:
+        """返回界面与日志使用的中文名称。"""
+        return "下一题" if self is NavigationDirection.NEXT else "上一题"
+
+
+class SwipeDirection(str, Enum):
+    """滑动手势的物理方向（实现层）。"""
+
+    LEFT = "left"
+    RIGHT = "right"
+
+    @property
+    def label(self) -> str:
+        """返回界面与日志使用的中文名称。"""
+        return "左滑" if self is SwipeDirection.LEFT else "右滑"
+
+
+@dataclass(frozen=True)
+class SwipeProfile:
+    """一次水平滑动手势的形状参数（不含方向）。
+
+    单独抽出该结构的目的：同一档手势参数既可以被“下一题”使用，
+    也可以被“上一题”使用；方向与形状解耦后，两侧的复用手势策略
+    只需要各配置一次，不必为每个方向复制一整套参数。
+
+    :param name: 档位名称，仅用于日志与调试。
+    :param distance_ratio: 拖动距离占捕获区域宽度的比例。
+    :param anchor_ratio: 拖动起点的纵向位置（占捕获区域高度比例）。
+    :param duration: 整段拖动耗时（秒）。
+    :param steps: 中间移动次数；过少可能不被页面手势识别器采信。
+    """
+
+    name: str
+    distance_ratio: float = 0.55
+    anchor_ratio: float = 0.5
+    duration: float = 0.32
+    steps: int = 8
+
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为便于日志输出的字典。"""
+        return {
+            "name": self.name,
+            "distance_ratio": self.distance_ratio,
+            "anchor_ratio": self.anchor_ratio,
+            "duration": self.duration,
+            "steps": self.steps,
+        }
+
+
 class AutomationActionType(str, Enum):
     """自动操作动作类型。"""
 
@@ -257,19 +323,28 @@ class AutomationActionType(str, Enum):
     CLICK_CONFIRM = "click_confirm"
     WAIT_FEEDBACK = "wait_feedback"
     CLICK_NEXT = "click_next"
+    # 滑动翻题：页面上不存在“上一题/下一题”按钮时，用手势模拟翻页。
+    SWIPE = "swipe"
     CLICK_SUBMIT = "click_submit"
     STOP = "stop"
 
 
 @dataclass
 class AutomationAction:
-    """一次自动化动作。"""
+    """一次自动化动作。
+
+    ``target`` 与 ``direction``/``profile`` 分别对应两种导航方式：
+    点击类动作使用 ``target`` 坐标；滑动类动作使用方向与手势参数。
+    """
 
     kind: AutomationActionType
     target: Optional[Tuple[int, int]] = None
     label: str = ""
     reason: str = ""
     timeout: float = 0.0
+    direction: Optional[NavigationDirection] = None
+    profile: Optional[SwipeProfile] = None
+
 
 
 @dataclass

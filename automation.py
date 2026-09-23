@@ -1,6 +1,6 @@
 """自动答题动作规划与同一题状态机。"""
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
@@ -9,8 +9,10 @@ from models import (
     AutomationAction,
     AutomationActionType,
     AutomationPlan,
+    NavigationDirection,
     QuestionSnapshot,
 )
+from navigation import NavigationPlanner, build_default_planner
 
 
 class SessionState(str, Enum):
@@ -23,10 +25,15 @@ class SessionState(str, Enum):
     DONE = "done"
 
 
-# 同一题最多重试点击“下一题”的次数。
-# 点击后页面没有推进（网络慢、按钮未响应）时允许有限次重试，
-# 达到上限即停止，避免在同一题上无限点击。
+# 同一题最多重试“推进到下一题”的次数（点击与滑动共用同一份预算）。
+# 点击后页面没有推进（网络慢、按钮未响应、滑动未被识别）时允许有限次重试，
+# 达到上限即停止，避免在同一题上无限点击或无限滑动。
 MAX_NEXT_CLICKS = 3
+
+# 同一题最多回退到“上一题”的次数。
+# 回退主要用于滑动过头或需要重新识别的场景；次数必须受限，
+# 否则一旦前进/回退判定抖动，程序会在两道题之间来回滑动。
+MAX_PREV_SWIPES = 2
 
 
 class QuestionSession:
@@ -37,6 +44,9 @@ class QuestionSession:
         self.state = SessionState.IDLE
         self.last_action_at = 0.0
         self.next_click_count = 0
+        self.prev_swipe_count = 0
+        #: 最近一次推进使用的方式（"click" / "swipe"），仅用于日志与排查。
+        self.last_navigation_method = ""
 
     def should_process(self, question: QuestionSnapshot) -> bool:
         """新题返回 True，同一题已经处理则返回 False。"""
@@ -46,6 +56,8 @@ class QuestionSession:
             self.state = SessionState.SOLVING
             self.last_action_at = time.time()
             self.next_click_count = 0
+            self.prev_swipe_count = 0
+            self.last_navigation_method = ""
             return True
         return False
 
@@ -59,15 +71,20 @@ class QuestionSession:
         self.state = SessionState.WAITING_NEXT
         self.last_action_at = time.time()
 
-    def record_next_click(self) -> None:
-        """记录一次“下一题”点击，并允许页面未推进时重试。
+    def record_next_click(self, method: str = "click") -> None:
+        """记录一次“推进到下一题”的尝试，并允许页面未推进时重试。
 
         与直接标记完成不同，这里保留 WAITING_NEXT 状态，
         使页面在等待时间内没有变化时可以再次尝试推进。
+
+        :param method: 本次尝试的方式（``"click"`` 点击按钮 / ``"swipe"`` 滑动手势）。
+            无按钮平台上滑动是唯一手段，因此与点击共用同一份尝试预算，
+            避免两个计数器各自放行导致实际尝试次数翻倍。
         """
         self.next_click_count += 1
         self.state = SessionState.WAITING_NEXT
         self.last_action_at = time.time()
+        self.last_navigation_method = method
 
     def can_retry_next(self, retry_after: float, now: Optional[float] = None) -> bool:
         """判断是否已经到安全重试下一题的时间。"""
@@ -75,6 +92,28 @@ class QuestionSession:
         return (
             self.state in {SessionState.WAITING_FEEDBACK, SessionState.WAITING_NEXT}
             and self.next_click_count < MAX_NEXT_CLICKS
+            and current - self.last_action_at >= retry_after
+        )
+
+    def record_prev_swipe(self) -> None:
+        """记录一次“回退到上一题”的滑动尝试。"""
+        self.prev_swipe_count += 1
+        self.last_action_at = time.time()
+        self.last_navigation_method = "swipe"
+
+    def can_swipe_prev(
+        self,
+        retry_after: float = 0.0,
+        now: Optional[float] = None,
+    ) -> bool:
+        """判断是否还允许回退“上一题”。
+
+        与 :meth:`can_retry_next` 不同，这里不限定会话状态：
+        回退既可能发生在等待反馈阶段（滑过头），也可能发生在题目完全无法解析时。
+        """
+        current = time.time() if now is None else now
+        return (
+            self.prev_swipe_count < MAX_PREV_SWIPES
             and current - self.last_action_at >= retry_after
         )
 
@@ -89,14 +128,22 @@ class QuestionSession:
         self.state = SessionState.IDLE
         self.last_action_at = 0.0
         self.next_click_count = 0
+        self.prev_swipe_count = 0
+        self.last_navigation_method = ""
 
 
 @dataclass
 class AutomationPlanner:
-    """根据题目和答案生成安全、可测试的动作列表。"""
+    """根据题目和答案生成安全、可测试的动作列表。
+
+    ``navigator`` 负责回答“怎么翻到下一题”：
+    页面有明确按钮时点击按钮，没有按钮时（部分平台只有手势翻页）
+    自动退化为滑动手势，具体由 :mod:`navigation` 的策略链决定。
+    """
 
     auto_next: bool = True
     feedback_timeout: float = 4.0
+    navigator: NavigationPlanner = field(default_factory=build_default_planner)
 
     def build(
         self,
@@ -145,17 +192,28 @@ class AutomationPlanner:
 
         # 纯提交按钮可能结束整场考试，无论配置如何都不进入自动计划。
         if self.auto_next:
-            next_button = question.button_boxes.get("next")
-            if next_button is not None:
-                if next_button.center is None:
-                    return self._stop("下一题按钮缺少可点击坐标")
-                actions.append(
-                    AutomationAction(
-                        kind=AutomationActionType.CLICK_NEXT,
-                        target=next_button.center,
-                        label=next_button.text,
+            navigation = self.navigator.resolve(question, NavigationDirection.NEXT)
+            if navigation is not None:
+                if navigation.is_gesture:
+                    # 平台没有“下一题”按钮：退化为滑动手势翻页。
+                    actions.append(
+                        AutomationAction(
+                            kind=AutomationActionType.SWIPE,
+                            direction=navigation.direction,
+                            profile=navigation.profile,
+                            label=navigation.label,
+                        )
                     )
-                )
+                elif navigation.target is None:
+                    return self._stop("下一题按钮缺少可点击坐标")
+                else:
+                    actions.append(
+                        AutomationAction(
+                            kind=AutomationActionType.CLICK_NEXT,
+                            target=navigation.target,
+                            label=navigation.label,
+                        )
+                    )
         return AutomationPlan(actions=actions)
 
     @staticmethod
@@ -169,4 +227,5 @@ class AutomationPlanner:
                 )
             ]
         )
+
 

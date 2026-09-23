@@ -3,6 +3,7 @@
 DEEPSEEK_API_KEY = "sk-local"
 DEEPSEEK_BASE_URL = "http://127.0.0.1:1234/v1"
 DEEPSEEK_MODEL = "qwen3.8-9b-heretic-uncensored-nvfp4"
+# DEEPSEEK_MODEL = "ternary-bonsai-2-27b"
 DEEPSEEK_ENABLE_SEARCH = False
 
 
@@ -97,6 +98,7 @@ DEFAULT_MODE = MODE_QUIZ
 
 KB_DB_PATH = "question_bank.db"
 EMBEDDING_BASE_URL = "http://127.0.0.1:1234/v1"
+# EMBEDDING_BASE_URL = "http://127.0.0.1/v1"
 EMBEDDING_MODEL = "text-embedding-qwen3-embedding-0.6b"
 EMBEDDING_API_KEY = "sk-local"
 SIMILARITY_THRESHOLD = 0.85     # 语义命中阈值
@@ -106,5 +108,42 @@ SIMILARITY_THRESHOLD = 0.85     # 语义命中阈值
 BUTTON_KEYWORDS = {
     "confirm": ["确认答案"],
     "next": ["下一题", "下一页", "下一章", "继续答题", "下一节"],
+    "prev": ["上一题", "上一页", "上一章", "上一节", "返回上一题"],
     "submit": ["提交答案", "提交"],
 }
+
+# ================== 滑动翻题回退 ==================
+# 背景：部分答题平台根本不提供“上一题 / 下一题”按钮，只能靠手势翻页。
+# 这类平台上程序会一直找不到“下一题”按钮，从而卡在同一题上反复识别。
+# 处理方式：找不到明确按钮时，退化为在捕获区域内做一次水平鼠标拖拽，
+# 用左滑模拟“下一题”、右滑模拟“上一题”。
+#
+# 注意：拖拽坐标始终被限制在捕获区域内，避免误拖到答题选项上造成误选。
+
+SWIPE_FALLBACK_ENABLED = True     # 未找到“下一题”按钮时，是否允许用滑动替代点击
+SWIPE_PREV_ENABLED = True         # 是否允许用滑动回退到“上一题”
+SWIPE_NEXT_DIRECTION = "left"     # 左滑 = 下一题
+SWIPE_PREV_DIRECTION = "right"    # 右滑 = 上一题
+
+# 手势参数梯度：(名称, 拖动距离比例, 纵向锚点比例, 总时长秒, 中间步数)。
+# 首次滑动用第一档；页面没有推进时逐档升级（拉长距离、上移锚点），
+# 避免在同一个无效手势上原地重试。
+SWIPE_PROFILES = (
+    ("标准", 0.55, 0.50, 0.32, 8),
+    ("长距", 0.75, 0.50, 0.38, 10),
+    ("长距上移", 0.75, 0.70, 0.38, 12),
+)
+
+SWIPE_SETTLE_WAIT = 1.2           # 滑动后等待页面刷新的秒数
+SWIPE_MAX_ATTEMPTS = 3            # 同一题最多尝试滑动推进的次数
+SWIPE_SKIP_STUCK_ENABLED = False  # 画面长时间无法解析且无按钮时，是否滑动跳走（默认关闭，按需开启）
+SWIPE_SKIP_STUCK_FRAMES = 8       # 连续无进展多少帧后触发上面的跳走逻辑
+SWIPE_SKIP_MAX_ESCAPES = 2        # 连续最多跳走多少帧；仍解析不出题目就回退一帧并放弃跳走
+SWIPE_SKIP_ROLLBACK_ENABLED = True  # 跳走失败时是否反向滑动回退一帧，避免越滑越远
+
+# ================== 手动翻题热键 ==================
+# 无按钮平台上用户也想手动翻题时使用：优先点击页面按钮，没有按钮则用滑动模拟。
+
+HOTKEY_PREV = "ctrl+f5"           # 手动上一题
+HOTKEY_NEXT = "ctrl+f6"           # 手动下一题
+

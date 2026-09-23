@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 import time
+from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 from PyQt5.QtCore import QObject, QThread, pyqtSignal
@@ -24,6 +25,10 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+#: 推进到下一题的两种方式标识，用于会话计数与等待时长选择。
+ADVANCE_METHOD_CLICK = "click"
+ADVANCE_METHOD_SWIPE = "swipe"
 
 
 def check_dependencies() -> None:
@@ -78,7 +83,9 @@ from config import (  # noqa: E402
     FEEDBACK_TIMEOUT,
     HOTKEY_CAPTURE,
     HOTKEY_EXIT,
+    HOTKEY_NEXT,
     HOTKEY_PAUSE,
+    HOTKEY_PREV,
     HOTKEY_SELECT,
     HOTKEY_TOGGLE_MODE,
     KB_DB_PATH,
@@ -90,6 +97,11 @@ from config import (  # noqa: E402
     POST_NEXT_WAIT,
     SCAN_INTERVAL,
     SIMILARITY_THRESHOLD,
+    SWIPE_SETTLE_WAIT,
+    SWIPE_SKIP_MAX_ESCAPES,
+    SWIPE_SKIP_ROLLBACK_ENABLED,
+    SWIPE_SKIP_STUCK_ENABLED,
+    SWIPE_SKIP_STUCK_FRAMES,
 )
 from ai_solver import DeepSeekSolver  # noqa: E402
 from answer_strategy import AnswerParser  # noqa: E402
@@ -102,12 +114,39 @@ from embedding_client import EmbeddingClient  # noqa: E402
 from knowledge_base import KnowledgeBase  # noqa: E402
 from models import (  # noqa: E402
     AnswerCandidate,
+    AutomationAction,
     AutomationActionType,
+    NavigationDirection,
     QuestionSnapshot,
+    SwipeDirection,
+    SwipeProfile,
+)
+from navigation import (  # noqa: E402
+    NavigationCommand,
+    build_default_planner,
 )
 from ocr_engine import OCREngine  # noqa: E402
 from overlay import AnswerOverlay  # noqa: E402
 from screen_operator import ScreenOperator  # noqa: E402
+
+
+@dataclass
+class NavigationOutcome:
+    """一次翻题（推进/回退）尝试的结果。
+
+    ``acted`` 表示是否真的产生了输入动作；
+    ``method`` 区分是点击按钮还是滑动手势，供调用方记录与选择等待时长。
+    实现 ``__bool__`` 是为了让调用点可以直接写 ``if outcome:``。
+    """
+
+    acted: bool = False
+    method: str = ""
+    direction: NavigationDirection = NavigationDirection.NEXT
+    detail: str = ""
+
+    def __bool__(self) -> bool:
+        """以是否产生动作为真值。"""
+        return self.acted
 
 
 class HotkeyHandler(QObject):
@@ -117,6 +156,8 @@ class HotkeyHandler(QObject):
     toggle_pause_signal = pyqtSignal()
     capture_signal = pyqtSignal()
     toggle_mode_signal = pyqtSignal()
+    navigate_prev_signal = pyqtSignal()
+    navigate_next_signal = pyqtSignal()
     exit_signal = pyqtSignal()
 
     def setup_hotkeys(self) -> None:
@@ -141,15 +182,25 @@ class HotkeyHandler(QObject):
                 lambda: self.toggle_mode_signal.emit(),
             )
             keyboard.add_hotkey(
+                HOTKEY_PREV,
+                lambda: self.navigate_prev_signal.emit(),
+            )
+            keyboard.add_hotkey(
+                HOTKEY_NEXT,
+                lambda: self.navigate_next_signal.emit(),
+            )
+            keyboard.add_hotkey(
                 HOTKEY_EXIT,
                 lambda: self.exit_signal.emit(),
             )
             logger.info(
-                "热键已注册: %s / %s / %s / %s / %s",
+                "热键已注册: %s / %s / %s / %s / %s / %s / %s",
                 HOTKEY_SELECT,
                 HOTKEY_PAUSE,
                 HOTKEY_CAPTURE,
                 HOTKEY_TOGGLE_MODE,
+                HOTKEY_PREV,
+                HOTKEY_NEXT,
                 HOTKEY_EXIT,
             )
         except Exception as exc:
@@ -162,6 +213,7 @@ class CaptureThread(QThread):
     result_signal = pyqtSignal(dict)
     status_signal = pyqtSignal(str)
     mode_signal = pyqtSignal(str)
+    message_signal = pyqtSignal(str)
 
     def __init__(self, mode: str = DEFAULT_MODE) -> None:
         """初始化线程状态，所有外部资源延迟到 run 中创建。"""
@@ -191,12 +243,20 @@ class CaptureThread(QThread):
 
         self.answer_parser = AnswerParser()
         self.session = QuestionSession()
+        # 导航规划器：页面有“上一题/下一题”按钮时点击按钮，
+        # 没有这类按钮时（部分平台只有手势翻页）退化为滑动模拟翻题。
+        self.navigator = build_default_planner()
         self.planner = AutomationPlanner(
             auto_next=AUTO_NEXT_ENABLED,
             feedback_timeout=FEEDBACK_TIMEOUT,
+            navigator=self.navigator,
         )
         self.last_question: Optional[QuestionSnapshot] = None
         self.last_answer: Optional[AnswerCandidate] = None
+        # 手动翻题请求（Ctrl+F5 / Ctrl+F6）：由 UI 线程写入，捕获线程消费。
+        self.manual_navigation: Optional[NavigationDirection] = None
+        # 卡死画面的跳走计数，用于限制“越滑越远”。
+        self.stuck_escape_count = 0
 
     def _load_region(self) -> Dict:
         """从磁盘加载用户选择的捕获区域。"""
@@ -232,7 +292,12 @@ class CaptureThread(QThread):
             self._print_banner()
             self.mode_signal.emit(self.mode)
             while self.running:
-                if self.single_shot:
+                if self.manual_navigation is not None:
+                    # 手动翻题优先执行，保证用户按下热键后立刻响应。
+                    direction = self.manual_navigation
+                    self.manual_navigation = None
+                    self._safe_manual_navigate(direction)
+                elif self.single_shot:
                     self.single_shot = False
                     self._safe_process()
                 elif not self.paused:
@@ -340,8 +405,9 @@ class CaptureThread(QThread):
             "当前模式: %s\n捕获区域: %s\n"
             "生成模型: %s\n"
             "自动点击: %s | 自动下一题: %s\n"
+            "%s\n"
             "快捷键: Ctrl+F1 区域 | Ctrl+F2 暂停 | Ctrl+F3 识别 | "
-            "Ctrl+F4 模式 | Ctrl+Q 退出\n%s",
+            "Ctrl+F4 模式 | Ctrl+F5 上一题 | Ctrl+F6 下一题 | Ctrl+Q 退出\n%s",
             "=" * 56,
             "=" * 56,
             mode_label,
@@ -349,6 +415,7 @@ class CaptureThread(QThread):
             ai_label,
             "开" if AUTO_CLICK_ENABLED else "关",
             "开" if AUTO_NEXT_ENABLED else "关",
+            self.navigator.describe(),
             "=" * 56,
         )
 
@@ -363,10 +430,14 @@ class CaptureThread(QThread):
         if question is None or not question.is_valid:
             # 识别不到可用题目时记录无进展原因，便于定位“卡在同一处”的问题。
             self._note_no_progress(question)
+            # 无按钮平台上“识别不出题目 + 没有按钮可点”会永久卡死，
+            # 按配置尝试用滑动跳走这一帧（默认关闭）。
+            self._try_escape_stuck_frame(question)
             return
 
         if self.session.should_process(question):
             self._reset_progress()
+            self.stuck_escape_count = 0
             self._handle_new_question(question)
         elif self.session.state in {
             SessionState.WAITING_FEEDBACK,
@@ -559,18 +630,236 @@ class CaptureThread(QThread):
                     return
                 if feedback is not None:
                     self._emit_answer(question, feedback)
-                if self._try_click_next(latest):
-                    # 记录点击而不是直接判定完成：页面若未推进仍可有限次重试。
-                    self.session.record_next_click()
-                    self.cooldown_until = time.time() + POST_NEXT_WAIT
+                outcome = self._try_advance(latest)
+                if outcome.acted:
+                    # 记录本次推进而不是直接判定完成：页面若未推进仍可有限次重试。
+                    self._record_advance(outcome.method)
                     return
                 self.session.mark_waiting_next()
-            elif action.kind == AutomationActionType.CLICK_NEXT:
-                if action.target is not None:
-                    self.operator.click_at(action.target)
-                    self.session.record_next_click()
-                    self.cooldown_until = time.time() + POST_NEXT_WAIT
+            elif action.kind in {
+                AutomationActionType.CLICK_NEXT,
+                AutomationActionType.SWIPE,
+            }:
+                # 计划中声明的兜底动作：等待阶段没有推进时按声明执行一次。
+                if self._execute_navigation_action(action):
+                    self._record_advance(
+                        ADVANCE_METHOD_SWIPE
+                        if action.kind == AutomationActionType.SWIPE
+                        else ADVANCE_METHOD_CLICK
+                    )
                     return
+
+    # ------------------------------------------------------------------
+    # 翻题（上一题 / 下一题）—— 按钮优先，滑动兜底
+    # ------------------------------------------------------------------
+    def _try_advance(
+        self,
+        question: Optional[QuestionSnapshot],
+        direction: NavigationDirection = NavigationDirection.NEXT,
+    ) -> NavigationOutcome:
+        """尝试翻到目标题目：优先点击页面按钮，按钮缺失时退化为滑动。
+
+        这是自动流程与手动热键共用的唯一入口，
+        “页面上到底有没有按钮”只在这里判断一次，避免逻辑分散。
+
+        :param question: 最新画面快照；为 ``None`` 时只能依赖滑动。
+        :param direction: 目标方向（下一题 / 上一题）。
+        """
+        if self.operator is None:
+            return NavigationOutcome(direction=direction)
+
+        attempt = (
+            self.session.next_click_count
+            if direction is NavigationDirection.NEXT
+            else self.session.prev_swipe_count
+        )
+        command = self.navigator.resolve(question, direction, attempt)
+        if command is None:
+            logger.info("未找到%s按钮，且滑动回退未启用，保持等待", direction.label)
+            return NavigationOutcome(direction=direction)
+
+        if not self._execute_navigation(command):
+            return NavigationOutcome(direction=direction, detail="执行失败")
+
+        return NavigationOutcome(
+            acted=True,
+            method=(
+                ADVANCE_METHOD_SWIPE
+                if command.is_gesture
+                else ADVANCE_METHOD_CLICK
+            ),
+            direction=direction,
+            detail=command.describe(),
+        )
+
+    def _execute_navigation(self, command: NavigationCommand) -> bool:
+        """按导航指令落地一次输入动作（按钮点击或滑动手势）。"""
+        if command.is_gesture:
+            return self._perform_swipe(command.swipe_direction, command.profile)
+        if command.target is None or self.operator is None:
+            return False
+        if self.operator.click_at(command.target):
+            logger.info(
+                "已点击%s（%s）",
+                command.direction.label,
+                command.label or "-",
+            )
+            return True
+        return False
+
+    def _execute_navigation_action(self, action: AutomationAction) -> bool:
+        """执行动作计划中声明的导航动作。"""
+        if action.kind == AutomationActionType.SWIPE:
+            return self._perform_swipe(
+                action.direction or NavigationDirection.NEXT,
+                action.profile,
+            )
+        if action.target is None or self.operator is None:
+            return False
+        if self.operator.click_at(action.target):
+            logger.info("已点击%s", action.label or "下一题")
+            return True
+        return False
+
+    def _perform_swipe(
+        self,
+        swipe_direction: Optional[SwipeDirection],
+        profile: Optional[SwipeProfile] = None,
+    ) -> bool:
+        """在捕获区域内执行一次滑动手势，用于模拟“上一题 / 下一题”。"""
+        if self.operator is None or swipe_direction is None:
+            return False
+        if self.operator.swipe(swipe_direction, profile):
+            logger.info(
+                "已用%s模拟翻题（档位 %s）",
+                swipe_direction.label,
+                profile.name if profile else "-",
+            )
+            return True
+        return False
+
+    def _record_advance(self, method: str) -> None:
+        """记录一次推进尝试，并按方式选择等待时长后进入冷却。
+
+        滑动手势后页面需要更长时间重绘，等待时长比点击更长，
+        否则下一帧会截到动画中间态，导致同一题被重复识别。
+        """
+        method = method or ADVANCE_METHOD_CLICK
+        self.session.record_next_click(method=method)
+        self.cooldown_until = time.time() + (
+            SWIPE_SETTLE_WAIT if method == ADVANCE_METHOD_SWIPE else POST_NEXT_WAIT
+        )
+
+    def _try_escape_stuck_frame(self, question: Optional[QuestionSnapshot]) -> bool:
+        """画面长时间无法解析时，按配置尝试滑动跳走，避免永久卡死。
+
+        仅在**页面上没有可点击按钮**（导航解析为手势）且连续无进展达到阈值时触发：
+        有按钮的页面交给正常流程处理，绝不在无法解析的画面上下发点击。
+        该能力默认关闭，需要时再打开 ``config.SWIPE_SKIP_STUCK_ENABLED``。
+
+        :return: 是否执行了跳走动作。
+        """
+        if not SWIPE_SKIP_STUCK_ENABLED or self.operator is None:
+            return False
+        if self.no_progress_count < SWIPE_SKIP_STUCK_FRAMES:
+            return False
+        if self.stuck_escape_count >= SWIPE_SKIP_MAX_ESCAPES:
+            return False
+
+        command = self.navigator.resolve(
+            question,
+            NavigationDirection.NEXT,
+            self.session.next_click_count,
+        )
+        if command is None or not command.is_gesture:
+            return False
+        if not self._execute_navigation(command):
+            return False
+
+        self.stuck_escape_count += 1
+        self.session.record_next_click(method=ADVANCE_METHOD_SWIPE)
+        self.cooldown_until = time.time() + SWIPE_SETTLE_WAIT
+        logger.warning(
+            "画面连续 %d 帧无法解析且没有可点击按钮，已%s跳过该画面（第 %d/%d 次）",
+            self.no_progress_count,
+            command.describe(),
+            self.stuck_escape_count,
+            SWIPE_SKIP_MAX_ESCAPES,
+        )
+        if (
+            self.stuck_escape_count >= SWIPE_SKIP_MAX_ESCAPES
+            and SWIPE_SKIP_ROLLBACK_ENABLED
+        ):
+            self._rollback_after_failed_escape(question)
+        # 重新计时，避免对同一画面立刻重复跳走。
+        self._reset_progress()
+        return True
+
+    def _rollback_after_failed_escape(
+        self,
+        question: Optional[QuestionSnapshot],
+    ) -> None:
+        """连续跳走仍解析不出题目时，反向滑动回退一帧。
+
+        跳走用于越过“识别不出且没有按钮”的异常画面；但若连着几帧都解析不出内容，
+        说明可能已经滑过头（例如越过了整页内容），此时回退一帧把页面恢复到
+        上一次的状态，再由人工确认，而不是继续盲目向前滑。
+        """
+        if not self.session.can_swipe_prev():
+            logger.warning("连续跳走仍无法解析题目，但回退次数已用尽，停止自动跳走")
+            return
+        command = self.navigator.resolve(
+            question,
+            NavigationDirection.PREV,
+            self.session.prev_swipe_count,
+        )
+        if command is None or not command.is_gesture:
+            logger.warning("连续跳走仍无法解析题目，且当前没有可用的回退方式，停止自动跳走")
+            return
+        if self._execute_navigation(command):
+            self.session.record_prev_swipe()
+            self.cooldown_until = time.time() + SWIPE_SETTLE_WAIT
+            logger.warning(
+                "已回退一帧（%s），请检查页面是否需要人工处理",
+                command.describe(),
+            )
+
+    def _safe_manual_navigate(self, direction: NavigationDirection) -> None:
+        """隔离手动翻题的异常，保证后台线程不中断。"""
+        try:
+            self.manual_navigate(direction)
+        except Exception as exc:
+            logger.error("手动%s失败: %s", direction.label, exc)
+
+    def manual_navigate(self, direction: NavigationDirection) -> bool:
+        """执行一次手动翻题（由 Ctrl+F5 / Ctrl+F6 触发）。
+
+        与自动流程共用 :meth:`_try_advance`，因此：
+        页面有按钮就点按钮，没有按钮就用滑动模拟，行为完全一致。
+
+        :return: 是否成功产生了翻题动作。
+        """
+        if self.operator is None:
+            self.message_signal.emit("尚未初始化完成，请稍后再试")
+            return False
+
+        snapshot = self.last_question if self.last_question is not None else None
+        outcome = self._try_advance(snapshot, direction)
+        if not outcome.acted:
+            self.message_signal.emit(
+                "未找到%s按钮，且滑动回退不可用" % direction.label
+            )
+            logger.warning("手动%s未生效: %s", direction.label, outcome.detail or "无可用导航方式")
+            return False
+
+        if direction is NavigationDirection.PREV:
+            self.session.record_prev_swipe()
+        else:
+            self.session.record_next_click(method=outcome.method)
+        self.cooldown_until = time.time() + SWIPE_SETTLE_WAIT
+        logger.info("手动翻题: %s", outcome.detail)
+        self.message_signal.emit("已%s" % outcome.detail)
+        return True
 
     def _resume_question(self, question: QuestionSnapshot) -> bool:
         """继续等待反馈或下一题按钮，不重复选择答案。
@@ -587,9 +876,9 @@ class CaptureThread(QThread):
 
         if not self.session.can_retry_next(POST_NEXT_WAIT):
             return acted
-        if self._try_click_next(question):
-            self.session.record_next_click()
-            self.cooldown_until = time.time() + POST_NEXT_WAIT
+        outcome = self._try_advance(question)
+        if outcome.acted:
+            self._record_advance(outcome.method)
             return True
         self.session.mark_waiting_next()
         return acted
@@ -652,19 +941,6 @@ class CaptureThread(QThread):
         logger.info("已捕获屏幕正确答案: %s", feedback.display_answer)
         return feedback
 
-    def _try_click_next(self, question: QuestionSnapshot) -> bool:
-        """只点击明确的下一题按钮，绝不点击提交按钮。"""
-        if self.operator is None:
-            return False
-        next_button = question.button_boxes.get("next")
-        if next_button is None or next_button.center is None:
-            logger.info("未找到明确的下一题按钮，保持等待")
-            return False
-        if self.operator.click_at(next_button.center):
-            logger.info("已点击下一题")
-            return True
-        return False
-
     def update_region(self, new_region: Dict) -> None:
         """更新捕获区域并重置当前题状态。"""
         self.region = dict(new_region)
@@ -687,6 +963,14 @@ class CaptureThread(QThread):
         self.session.reset()
         self.single_shot = True
 
+    def request_navigation(self, direction: NavigationDirection) -> None:
+        """登记一次手动翻题请求，由捕获线程在下一轮循环中执行。
+
+        不在 UI 线程直接操作鼠标：鼠标动作必须与 OCR、点击共用同一个线程，
+        否则会出现两次输入互相打断的情况。
+        """
+        self.manual_navigation = direction
+
     def toggle_mode(self) -> str:
         """切换做题和题库记录模式。"""
         self.mode = MODE_RECORD if self.mode == MODE_QUIZ else MODE_QUIZ
@@ -707,17 +991,35 @@ class AutoAnswerApp:
         self.thread.result_signal.connect(self.overlay.show_answer)
         self.thread.status_signal.connect(self.overlay.update_status)
         self.thread.mode_signal.connect(self._on_mode_changed)
+        self.thread.message_signal.connect(self.overlay.show_message)
 
         self.hotkey_handler = HotkeyHandler()
         self.hotkey_handler.select_region_signal.connect(self._on_select_region)
         self.hotkey_handler.toggle_pause_signal.connect(self._on_toggle_pause)
         self.hotkey_handler.capture_signal.connect(self._on_capture)
         self.hotkey_handler.toggle_mode_signal.connect(self._on_toggle_mode)
+        self.hotkey_handler.navigate_prev_signal.connect(self._on_navigate_prev)
+        self.hotkey_handler.navigate_next_signal.connect(self._on_navigate_next)
         self.hotkey_handler.exit_signal.connect(self._on_exit)
         self.hotkey_handler.setup_hotkeys()
 
         self.thread.start()
-        self.overlay.update_status("Ctrl+F3 手动识别 | Ctrl+F4 切换模式")
+        self.overlay.update_status(
+            "Ctrl+F3 手动识别 | Ctrl+F4 切换模式 | Ctrl+F5/F6 翻题"
+        )
+
+    def _on_navigate_prev(self) -> None:
+        """手动翻到上一题（无按钮平台自动用右滑模拟）。"""
+        self._request_navigation(NavigationDirection.PREV)
+
+    def _on_navigate_next(self) -> None:
+        """手动翻到下一题（无按钮平台自动用左滑模拟）。"""
+        self._request_navigation(NavigationDirection.NEXT)
+
+    def _request_navigation(self, direction: NavigationDirection) -> None:
+        """把翻题请求交给后台线程执行，避免在 UI 线程里操作鼠标。"""
+        self.overlay.show_message("正在请求%s…" % direction.label)
+        self.thread.request_navigation(direction)
 
     def _on_mode_changed(self, mode: str) -> None:
         """显示模式切换结果。"""
