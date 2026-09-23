@@ -156,6 +156,11 @@ class QuestionSnapshot:
     is_valid: bool = False
     error: str = ""
     button_boxes: Dict[str, ButtonItem] = field(default_factory=dict)
+    #: 本帧截图的画面签名（由识别层填充）。
+    #: 上层用它判断“画面是否真的变了”，从而区分
+    #: “页面已翻到新题但新题解析不出来”与“画面根本没动”——
+    #: 后者不该再对旧题目重复点击或滑动。
+    frame_signature: str = ""
 
     @property
     def identity_key(self) -> str:

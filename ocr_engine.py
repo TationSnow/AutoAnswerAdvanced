@@ -223,6 +223,11 @@ class OCREngine:
     CONTINUATION_GAP_RATIO = 1.8
     DUPLICATE_TOLERANCE = 14
     MIN_QUESTION_CHARS = 4
+    # 选项标签与正文之间缺失标点时补上的标准分隔符，以及合法分隔符集合。
+    # 真机实测：部分平台选项标签是灰底圆形徽章里的单个字母，与右侧文字之间
+    # 没有任何标点，OCR 输出形如 “A 工作证”。
+    DEFAULT_OPTION_SEPARATOR = "."
+    OPTION_SEPARATOR_CHARS = ".\u3001\uff0e:\uff1a)\uff09"
     # 判定“这确实是一张题目画面”的题干最短长度，用于决定是否值得付出补救识别开销。
     RESCUE_MIN_QUESTION_CHARS = 10
     # 题干中出现这些字样时，即使题型标签识别失败也按判断题解析（对/错）选项。
@@ -252,6 +257,9 @@ class OCREngine:
         # 补救通道冷却状态，避免同一画面反复补救。
         self._last_fallback_signature = ""
         self._last_fallback_at = 0.0
+        # 上一次补救识别的结果与所用策略，供冷却期内复用（保证同一画面解析一致）。
+        self._cached_rescue_items: List[Dict[str, Any]] = []
+        self._cached_rescue_name = ""
         # 最近一次识别使用的补救策略名称，供日志与调试工具查看。
         self.last_rescue_name = ""
         if not show_log:
@@ -282,6 +290,8 @@ class OCREngine:
         engine._supports_kwargs = None
         engine._last_fallback_signature = ""
         engine._last_fallback_at = 0.0
+        engine._cached_rescue_items = []
+        engine._cached_rescue_name = ""
         engine.last_rescue_name = ""
         return engine
 
@@ -338,6 +348,8 @@ class OCREngine:
 
             # 尺寸守卫：先补边、必要时缩放，并把坐标换算比例记录下来。
             img_array, scale = self._limit_image_size(img_array)
+            # 画面签名在缩放/补边之后计算，保证同一帧输入始终得到同一签名。
+            signature = self._frame_signature(img_array)
 
             primary = self._primary_params()
             result, elapsed = self._invoke_ocr(img_array, primary)
@@ -346,17 +358,31 @@ class OCREngine:
             snapshot = self._apply_confidence(snapshot, items)
 
             rescue_name = ""
-            if self._should_rescue(snapshot, items, img_array):
-                rescuer, rescue_items, rescue_elapsed = self._run_rescue(img_array, items)
+            if self._should_rescue(snapshot, items, signature):
+                rescuer, rescue_items, rescue_elapsed = self._run_rescue(
+                    img_array, items, signature
+                )
                 if rescuer is not None:
                     elapsed += rescue_elapsed
                     rescue_name = rescuer.name
-                    if rescue_items:
-                        merged = self._merge_items(items, rescue_items)
-                        if len(merged) > len(items):
-                            items = merged
-                            snapshot = self.parse_items(items)
-                            snapshot = self._apply_confidence(snapshot, items)
+                    merged = self._merge_if_richer(items, rescue_items)
+                    if merged is not None:
+                        items = merged
+                        snapshot = self.parse_items(items)
+                        snapshot = self._apply_confidence(snapshot, items)
+            else:
+                # 冷却期内不再重复推理，但必须**复用**上次的补救结果：
+                # 否则同一页面会产出两种不同的解析输入（含/不含补救文字块），
+                # 上层靠文本判断“画面是否变化”就会每帧漂移，
+                # 无进展退避与告警将永远无法触发。
+                merged = self._merge_if_richer(
+                    items, self._reusable_rescue_items(signature)
+                )
+                if merged is not None:
+                    items = merged
+                    rescue_name = "%s(复用)" % self._cached_rescue_name
+                    snapshot = self.parse_items(items)
+                    snapshot = self._apply_confidence(snapshot, items)
 
             if scale != 1.0:
                 # 坐标换算回原始截图空间，保证后续点击位置正确。
@@ -364,6 +390,8 @@ class OCREngine:
                 snapshot = self.parse_items(items)
                 snapshot = self._apply_confidence(snapshot, items)
 
+            # 把帧签名交给上层：用于区分“画面真的变了”与“同一画面反复失败”。
+            snapshot.frame_signature = signature
             logger.info(
                 "OCR: 推理=%.2fs | %d 行 | 平均置信度=%.2f | 题型=%s%s",
                 elapsed,
@@ -465,21 +493,49 @@ class OCREngine:
         self,
         snapshot: QuestionSnapshot,
         items: Sequence[Dict[str, Any]],
-        image: np.ndarray,
+        signature: str,
     ) -> bool:
-        """判断是否需要启动补救识别。"""
+        """判断是否需要启动补救识别。
+
+        :param signature: 当前帧的画面签名（由 :meth:`recognize` 统一计算）。
+        """
         if snapshot.is_valid:
             return False
         # 只识别到零散文字、看不出题目结构时，不值得再付出一次识别开销。
         if items and not self._looks_like_question(snapshot):
             return False
-        signature = self._frame_signature(image)
         if (
             signature == self._last_fallback_signature
             and time.time() - self._last_fallback_at < OCR_RESCUE_COOLDOWN
         ):
             return False
         return True
+
+    def _reusable_rescue_items(self, signature: str) -> List[Dict[str, Any]]:
+        """取回上一次补救识别的结果（仅在画面签名完全相同时复用）。
+
+        冷却期内重复补救同一画面既浪费算力，又会让同一页面产出两种不同的解析输入
+        （补救前 / 补救后），使上层“画面是否变化”的判断每帧漂移。
+        因此这里把上次结果按帧号缓存起来复用。
+        """
+        if not signature or signature != self._last_fallback_signature:
+            return []
+        return [dict(item) for item in self._cached_rescue_items]
+
+    def _merge_if_richer(
+        self,
+        items: Sequence[Dict[str, Any]],
+        extra: Sequence[Dict[str, Any]],
+    ) -> Optional[List[Dict[str, Any]]]:
+        """仅在补救结果带来更多文字块时才接受合并。
+
+        主通道结果更干净，补救结果更全但噪声更多；只有确实多出文字块时才替换，
+        避免用噪声覆盖主通道的高质量结果。
+        """
+        if not extra:
+            return None
+        merged = self._merge_items(items, extra)
+        return merged if len(merged) > len(items) else None
 
     def _looks_like_question(self, snapshot: QuestionSnapshot) -> bool:
         """判断一帧画面是否具备题目页面的结构特征。"""
@@ -493,12 +549,17 @@ class OCREngine:
         return question_length >= self.RESCUE_MIN_QUESTION_CHARS
 
     def _run_rescue(
-        self, image: np.ndarray, items: Sequence[Dict[str, Any]]
+        self,
+        image: np.ndarray,
+        items: Sequence[Dict[str, Any]],
+        signature: str,
     ) -> Tuple[Optional[OcrRescueStrategy], List[Dict[str, Any]], float]:
         """按注册顺序尝试补救策略，返回第一个产出文字块的策略。"""
-        self._last_fallback_signature = self._frame_signature(image)
+        self._last_fallback_signature = signature
         self._last_fallback_at = time.time()
         self.last_rescue_name = ""
+        self._cached_rescue_items = []
+        self._cached_rescue_name = ""
         elapsed_total = 0.0
         for strategy in self.rescue_registry:
             prepared = strategy.prepare(image, items)
@@ -509,6 +570,8 @@ class OCREngine:
             rescued = self._extract_items(result, strategy.params.min_item_score)
             if rescued:
                 self.last_rescue_name = strategy.name
+                self._cached_rescue_name = strategy.name
+                self._cached_rescue_items = [dict(item) for item in rescued]
                 logger.info(
                     "已启用补救识别（%s）: %d 个文字块，耗时 %.2fs",
                     strategy.name,
@@ -904,7 +967,9 @@ class OCREngine:
                         (
                             index,
                             self._combine_items(
-                                item, following, "%s %s" % (text, following["text"].strip())
+                                item,
+                                following,
+                                self._join_option_label(text, following["text"]),
                             ),
                         )
                     )
@@ -913,6 +978,27 @@ class OCREngine:
             result.append((index, item))
             index += 1
         return result
+
+    @classmethod
+    def _join_option_label(cls, label_text: str, content: str) -> str:
+        """把“徽章标签框 + 同行正文框”拼成标准选项行。
+
+        部分平台的选项标签是圆形（或圆角）徽章里的单个字母，与右侧文字之间
+        没有任何标点，OCR 会把它们识别成两个独立文本框。如果按原样用空格拼接，
+        要求“标签后必须跟标点”的 :data:`OPTION_LINE_RE` 会判定该行不是选项，
+        于是**整题选项全部丢失**（真机表现为“仅识别到 0 个选项”）。
+
+        这里把这类版式差异在解析层收敛掉：标签缺少标点时补一个标准分隔符，
+        使下游选项解析、点击坐标计算完全复用同一条路径。
+        """
+        label = (label_text or "").strip()
+        content = (content or "").strip()
+        if not label:
+            return content
+        if label[-1] in cls.OPTION_SEPARATOR_CHARS:
+            # 已经带标点（如 “A.”“B、”）时保持原样，不改变既有语义。
+            return "%s %s" % (label, content)
+        return "%s%s%s" % (label, cls.DEFAULT_OPTION_SEPARATOR, content)
 
     def _combine_items(
         self, first: Dict[str, Any], second: Dict[str, Any], text: str

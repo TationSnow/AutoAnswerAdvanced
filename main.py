@@ -451,9 +451,17 @@ class CaptureThread(QThread):
             self._note_no_progress(question)
 
     def _no_progress_identity(self, question: Optional[QuestionSnapshot]) -> str:
-        """生成“无进展画面”的身份标识，用于判断画面是否真的没有变化。"""
+        """生成“无进展画面”的身份标识，用于判断画面是否真的没有变化。
+
+        优先使用识别层给出的**画面签名**：OCR 文本会因为补救通道的冷却而在
+        “含补救文字块”与“仅主通道”之间抖动，按文本算身份会让同一画面每帧都
+        被当成新画面，退避与告警因此永远不触发（真机日志中出现过该现象）。
+        签名缺失时（例如手工构造的快照、调试路径）退回按文本计算。
+        """
         if question is None:
             return "no-frame"
+        if question.frame_signature:
+            return "frame:%s" % question.frame_signature
         raw = question.raw_text or ""
         raw_signature = (
             hashlib.md5(raw.encode("utf-8")).hexdigest()[:12] if raw else ""
@@ -499,6 +507,11 @@ class CaptureThread(QThread):
                 reason,
                 self.scan_interval,
                 raw or "（空）",
+            )
+            # 仅靠日志刷屏时用户完全看不到异常，这里同步给悬浮窗一个可见提示。
+            self.message_signal.emit(
+                "画面连续 %d 次无法识别题目，请检查捕获区域或用 Ctrl+F5/F6 手动翻题"
+                % self.no_progress_count
             )
 
     def _reset_progress(self) -> None:
@@ -889,13 +902,26 @@ class CaptureThread(QThread):
         answer: AnswerCandidate,
         timeout: float,
     ) -> Tuple[QuestionSnapshot, Optional[AnswerCandidate], bool]:
-        """轮询屏幕，等待答案解析或新题出现。"""
+        """轮询屏幕，等待答案解析或新题出现。
+
+        判定顺序很关键：
+
+        1. 解析成功且题目身份变了 —— 新题已出现，视为已推进；
+        2. 解析成功且出现“正确答案/解析”字样 —— 捕获页面反馈；
+        3. 解析失败但**画面签名变了** —— 说明页面确实翻走了，只是新题版式
+           暂时解析不出来，同样按“已推进”处理。否则会对旧题目补发点击或滑动
+           （真机日志里出现过这种无效动作），并让新题被反复重试。
+        """
         deadline = time.time() + timeout
         latest = question
         while time.time() < deadline:
             time.sleep(FEEDBACK_POLL_INTERVAL)
             snapshot = self._capture_question()
-            if snapshot is None or not snapshot.is_valid:
+            if snapshot is None:
+                continue
+            if not snapshot.is_valid:
+                if self._frame_changed(question, snapshot):
+                    return snapshot, None, True
                 continue
             latest = snapshot
             if snapshot.identity_key != question.identity_key:
@@ -905,6 +931,19 @@ class CaptureThread(QThread):
                 if feedback is not None:
                     return snapshot, feedback, False
         return latest, None, False
+
+    @staticmethod
+    def _frame_changed(
+        previous: QuestionSnapshot,
+        current: QuestionSnapshot,
+    ) -> bool:
+        """判断两帧画面是否确实不同（缺任一方签名时保守返回 False）。
+
+        只用于“解析失败”的快照：能解析出题目的情况已经由题目身份判断覆盖。
+        """
+        if not previous.frame_signature or not current.frame_signature:
+            return False
+        return previous.frame_signature != current.frame_signature
 
     def _has_feedback_text(self, raw_text: str) -> bool:
         """判断页面是否真的出现了答案反馈。"""
